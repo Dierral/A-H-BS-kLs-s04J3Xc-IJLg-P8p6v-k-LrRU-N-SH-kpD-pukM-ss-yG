@@ -182,6 +182,8 @@ class LolzAPI:
         if balance_id is not None:
             body["balance_id"] = int(balance_id)
 
+        print(f"[FAST-BUY] item={item_id} body={body}")
+
         # form-urlencoded как веб
         form = {k: str(v) for k, v in body.items()} if body else None
         result = await self._request("POST", f"/{item_id}/fast-buy", form=form)
@@ -574,90 +576,179 @@ def is_insufficient_funds(data: dict) -> bool:
     return any(k in text for k in keys)
 
 
-def _pick_balance_id(balances_payload: dict) -> int | None:
+def _collect_balance_list(payload) -> list:
+    """Достаёт список балансов из любого типичного ответа API."""
+    if not payload:
+        return []
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if not isinstance(payload, dict):
+        return []
+    if payload.get("_error"):
+        return []
+
+    # прямое поле balances (как сказал специалист — GET /me)
+    for key in ("balances", "items", "list", "data", "exchange"):
+        val = payload.get(key)
+        if isinstance(val, list):
+            return [x for x in val if isinstance(x, dict)]
+        if isinstance(val, dict):
+            # dict balance_id -> info  ИЛИ  currency -> info
+            out = []
+            for k, v in val.items():
+                if isinstance(v, dict):
+                    item = dict(v)
+                    if "balance_id" not in item and "id" not in item:
+                        try:
+                            item["balance_id"] = int(k)
+                        except Exception:
+                            item.setdefault("currency", k)
+                    out.append(item)
+                elif isinstance(v, (int, float, str)):
+                    # {"rub": 205.0} или {"12345": 205}
+                    try:
+                        out.append({"balance_id": int(k), "amount": float(v), "currency": str(k)})
+                    except Exception:
+                        out.append({"currency": str(k), "amount": v})
+            if out:
+                return out
+
+    # вложенный user.balances
+    user = payload.get("user")
+    if isinstance(user, dict):
+        nested = _collect_balance_list(user)
+        if nested:
+            return nested
+
+    if any(k in payload for k in ("balance_id", "id", "currency", "type")):
+        return [payload]
+    return []
+
+
+def _pick_balance_id(balances_payload) -> int | None:
     """
-    Выбирает balance_id для покупок в CURRENCY (по умолчанию rub).
-    Структура ответа API может отличаться — перебираем типичные поля.
+    Выбирает balance_id кошелька «для покупок».
+    Приоритет (по ответу специалиста Lolz):
+      1) type/name содержит purchase / buy / покупок
+      2) currency == CURRENCY (rub)
+      3) максимальный amount
     """
-    if not balances_payload or balances_payload.get("_error"):
+    candidates = _collect_balance_list(balances_payload)
+    if not candidates:
         return None
 
-    candidates = []
-    for key in ("balances", "items", "list", "data", "exchange"):
-        val = balances_payload.get(key)
-        if isinstance(val, list):
-            candidates = val
-            break
-        if isinstance(val, dict):
-            # иногда dict id -> info
-            candidates = list(val.values())
-            break
-
-    if not candidates and isinstance(balances_payload, list):
-        candidates = balances_payload
-
-    # если весь payload — один объект баланса
-    if not candidates and any(k in balances_payload for k in ("balance_id", "id", "currency")):
-        candidates = [balances_payload]
-
     currency_want = CURRENCY.lower()
-    best = None
-    best_amount = -1.0
 
+    def bid_of(b: dict):
+        for k in ("balance_id", "id", "balanceId", "wallet_id"):
+            if b.get(k) is not None:
+                try:
+                    return int(b[k])
+                except Exception:
+                    pass
+        return None
+
+    def amount_of(b: dict) -> float:
+        for k in ("amount", "balance", "value", "money", "sum"):
+            if b.get(k) is not None:
+                try:
+                    return float(b[k])
+                except Exception:
+                    pass
+        return 0.0
+
+    def meta_text(b: dict) -> str:
+        parts = []
+        for k in (
+            "type", "name", "title", "label", "description",
+            "balance_type", "kind", "slug", "code",
+        ):
+            if b.get(k) is not None:
+                parts.append(str(b[k]))
+        return " ".join(parts).lower()
+
+    purchase_keys = (
+        "покуп", "purchase", "buy", "buying", "spend",
+        "market", "для покупок", "purchases",
+    )
+
+    scored = []
     for b in candidates:
-        if not isinstance(b, dict):
-            continue
-        bid = b.get("balance_id") or b.get("id") or b.get("balanceId")
+        bid = bid_of(b)
         if bid is None:
             continue
         cur = str(
             b.get("currency") or b.get("currency_code") or b.get("code") or ""
         ).lower()
-        amount = b.get("amount") or b.get("balance") or b.get("value") or b.get("money") or 0
-        try:
-            amount = float(amount)
-        except Exception:
-            amount = 0.0
+        amount = amount_of(b)
+        meta = meta_text(b)
+        is_purchase = any(k in meta for k in purchase_keys)
+        # иногда type=1 purchase, type=0 withdraw и т.п.
+        if str(b.get("type") or "").lower() in ("purchase", "buy", "1"):
+            is_purchase = True
+        cur_ok = (cur == currency_want) or (currency_want in cur) or (cur in currency_want) or not cur
+        scored.append((is_purchase, cur_ok, amount, bid, b))
+        print(
+            f"[BALANCE item] id={bid} cur={cur or '?'} amount={amount} "
+            f"purchase={is_purchase} meta={meta[:80]!r}"
+        )
 
-        # предпочитаем нужную валюту с максимальным остатком
-        if cur == currency_want or currency_want in cur or cur in currency_want:
-            if amount > best_amount:
-                best_amount = amount
-                best = int(bid)
-        elif best is None and amount > 0:
-            # fallback: любой положительный
-            best = int(bid)
-            best_amount = amount
+    if not scored:
+        return None
 
-    return best
+    # 1) явно «для покупок»
+    purchase = [x for x in scored if x[0]]
+    if purchase:
+        purchase.sort(key=lambda x: (x[1], x[2]), reverse=True)
+        return purchase[0][3]
+
+    # 2) нужная валюта с макс. суммой
+    same_cur = [x for x in scored if x[1]]
+    if same_cur:
+        same_cur.sort(key=lambda x: x[2], reverse=True)
+        return same_cur[0][3]
+
+    # 3) любой с макс. суммой
+    scored.sort(key=lambda x: x[2], reverse=True)
+    return scored[0][3]
 
 
 async def resolve_balance_id() -> int | None:
-    """LOLZ_BALANCE_ID из env или авто из API."""
+    """
+    balance_id для fast-buy.
+    Специалист Lolz: брать из GET /me → balances (кошелёк «для покупок»).
+    """
     global _cached_balance_id
     if LOLZ_BALANCE_ID > 0:
+        print(f"[BALANCE] from env LOLZ_BALANCE_ID={LOLZ_BALANCE_ID}")
         return LOLZ_BALANCE_ID
     if _cached_balance_id is not None:
         return _cached_balance_id
 
-    data = await lolz.get_balances()
-    print(f"[BALANCE] raw keys={list(data.keys()) if isinstance(data, dict) else type(data)}")
-    raw = json.dumps(data, ensure_ascii=False, default=str)
-    print(f"[BALANCE] snippet: {raw[:1000]}")
+    # 1) главный источник — GET /me
+    me = await lolz.get_profile()
+    print(f"[BALANCE /me] keys={list(me.keys()) if isinstance(me, dict) else type(me)}")
+    print(f"[BALANCE /me] snippet: {json.dumps(me, ensure_ascii=False, default=str)[:1500]}")
 
-    bid = _pick_balance_id(data)
+    bid = _pick_balance_id(me)
+    if bid is None and isinstance(me.get("user"), dict):
+        bid = _pick_balance_id(me["user"])
+    if bid is None and me.get("balances") is not None:
+        bid = _pick_balance_id({"balances": me["balances"]})
+
+    # 2) запасной endpoint
     if bid is None:
-        # пробуем вытащить из /me
-        me = await lolz.get_profile()
-        print(f"[BALANCE /me] snippet: {json.dumps(me, ensure_ascii=False, default=str)[:1000]}")
-        bid = _pick_balance_id(me)
-        if bid is None and isinstance(me.get("user"), dict):
-            bid = _pick_balance_id(me["user"])
-        if bid is None:
-            bid = _pick_balance_id({"balances": me.get("balances") or me.get("balance")})
+        data = await lolz.get_balances()
+        print(f"[BALANCE exchange] snippet: {json.dumps(data, ensure_ascii=False, default=str)[:1000]}")
+        bid = _pick_balance_id(data)
 
     _cached_balance_id = bid
     print(f"[BALANCE] selected balance_id={bid}")
+    if bid is None:
+        print(
+            "[BALANCE] ⚠️ не нашли balance_id. "
+            "Задай вручную LOLZ_BALANCE_ID из /me → balances"
+        )
     return bid
 
 
