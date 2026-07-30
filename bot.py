@@ -9,7 +9,7 @@ from pathlib import Path
 from datetime import datetime
 
 import aiohttp
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, Button
 from telethon.tl.functions.messages import StartBotRequest
 from telethon.sessions import StringSession, SQLiteSession
 from telethon.crypto import AuthKey
@@ -28,7 +28,18 @@ LOLZ_TOKEN = os.environ["LOLZ_TOKEN"]
 
 MAMBA_BOT = os.environ.get("MAMBA_BOT", "mambarubot")
 
-LOG_SUPERGROUP_ID = int(os.environ["LOG_SUPERGROUP_ID"])
+def _normalize_chat_id(raw: str) -> int:
+    """
+    4331188948     → -1004331188948
+    -1004331188948 → как есть
+    """
+    n = int(str(raw).strip())
+    if n > 0:
+        return int(f"-100{n}")
+    return n
+
+
+LOG_SUPERGROUP_ID = _normalize_chat_id(os.environ["LOG_SUPERGROUP_ID"])
 TOPIC_LOGS = int(os.environ["TOPIC_LOGS"])
 TOPIC_VALID = int(os.environ["TOPIC_VALID"])
 TOPIC_NOVALID = int(os.environ["TOPIC_NOVALID"])
@@ -40,9 +51,13 @@ MAX_TRIES = int(os.environ.get("MAX_TRIES", "40"))
 RETRY_MAX = int(os.environ.get("RETRY_MAX", "30"))
 CURRENCY = os.environ.get("CURRENCY", "rub")
 AUTO_CLAIM_ON_DEAD = os.environ.get("AUTO_CLAIM_ON_DEAD", "1") == "1"
+# После сплита балансов на маркете — ID кошелька для покупок (0 = авто)
+LOLZ_BALANCE_ID = int(os.environ.get("LOLZ_BALANCE_ID", "0") or "0")
 
 LOLZ_BASE = os.environ.get("LOLZ_BASE", "https://prod-api.lzt.market")
 REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "300"))
+
+_cached_balance_id: int | None = None
 
 DC_IP_MAP = {
     1: "149.154.175.53",
@@ -150,14 +165,74 @@ class LolzAPI:
     async def check_account(self, item_id: int):
         return await self._request("POST", f"/{item_id}/check-account")
 
-    async def fast_buy(self, item_id: int, price: float | None = None):
-        body = {}
+    async def fast_buy(
+        self,
+        item_id: int,
+        price: float | None = None,
+        balance_id: int | None = None,
+    ):
+        """
+        POST /{item_id}/fast-buy
+        После разделения балансов на маркете ОБЯЗАТЕЛЕН balance_id,
+        иначе API отвечает «недостаточно средств» при живых деньгах.
+        """
+        body: dict = {}
         if price is not None:
-            body["price"] = price
-        return await self._request("POST", f"/{item_id}/fast-buy", json_body=body or None)
+            body["price"] = float(price)
+        if balance_id is not None:
+            body["balance_id"] = int(balance_id)
+
+        # form-urlencoded как веб
+        form = {k: str(v) for k, v in body.items()} if body else None
+        result = await self._request("POST", f"/{item_id}/fast-buy", form=form)
+        if not result.get("_error"):
+            return result
+
+        # fallback json
+        if body:
+            result2 = await self._request(
+                "POST", f"/{item_id}/fast-buy", json_body=body
+            )
+            if not result2.get("_error"):
+                return result2
+            result = result2
+
+        # ещё попытка: только balance_id без price
+        if balance_id is not None and price is not None:
+            only_bal = {"balance_id": int(balance_id)}
+            result3 = await self._request(
+                "POST",
+                f"/{item_id}/fast-buy",
+                form={k: str(v) for k, v in only_bal.items()},
+            )
+            if not result3.get("_error"):
+                return result3
+            result3 = await self._request(
+                "POST", f"/{item_id}/fast-buy", json_body=only_bal
+            )
+            if not result3.get("_error"):
+                return result3
+
+        return result
 
     async def get_item(self, item_id: int):
         return await self._request("GET", f"/{item_id}")
+
+    async def get_profile(self):
+        return await self._request("GET", "/me")
+
+    async def get_balances(self):
+        """Список балансов (после сплита кошельков)."""
+        # в доке: GET /balance/exchange — Returns list of balances
+        r = await self._request("GET", "/balance/exchange")
+        if not r.get("_error"):
+            return r
+        # запасные пути
+        for path in ("/balances", "/balance", "/user/balances"):
+            r2 = await self._request("GET", path)
+            if not r2.get("_error"):
+                return r2
+        return r
 
     async def create_claim(self, item_id: int, description: str):
         """
@@ -288,9 +363,31 @@ def now_str() -> str:
     return datetime.now().strftime("%d.%m.%Y %H:%M:%S")
 
 
+_log_entity = None
+
+
+async def resolve_log_chat(client: TelegramClient):
+    """Резолвит супергруппу, чтобы Telethon знал entity."""
+    global _log_entity
+    if _log_entity is not None:
+        return _log_entity
+    try:
+        _log_entity = await client.get_entity(LOG_SUPERGROUP_ID)
+        print(
+            f"[LOG CHAT] resolved id={getattr(_log_entity, 'id', LOG_SUPERGROUP_ID)} "
+            f"title={getattr(_log_entity, 'title', '?')}"
+        )
+        return _log_entity
+    except Exception as e:
+        print(f"[LOG CHAT] get_entity({LOG_SUPERGROUP_ID}) failed: {e}")
+        _log_entity = LOG_SUPERGROUP_ID
+        return _log_entity
+
+
 async def send_to_topic(client: TelegramClient, topic_id: int, text: str, file=None):
+    entity = await resolve_log_chat(client)
     kwargs = {
-        "entity": LOG_SUPERGROUP_ID,
+        "entity": entity,
         "message": text,
         "link_preview": False,
         "reply_to": topic_id,
@@ -446,8 +543,148 @@ async def check_mamba_with_session(
                 pass
 
 
+def extract_errors(data: dict) -> str:
+    if not data:
+        return ""
+    errs = data.get("errors") or data.get("error") or data.get("message") or ""
+    if isinstance(errs, list):
+        parts = []
+        for e in errs:
+            if isinstance(e, dict):
+                parts.append(str(e.get("message") or e.get("error") or e))
+            else:
+                parts.append(str(e))
+        text = " | ".join(parts)
+    else:
+        text = str(errs)
+    # убрать html из ответа маркета
+    text = re.sub(r"<[^>]+>", "", text)
+    return text.strip()
+
+
+def is_insufficient_funds(data: dict) -> bool:
+    text = extract_errors(data).lower()
+    keys = (
+        "недостаточно средств",
+        "not enough",
+        "insufficient",
+        "не хватает",
+        "not enough balance",
+    )
+    return any(k in text for k in keys)
+
+
+def _pick_balance_id(balances_payload: dict) -> int | None:
+    """
+    Выбирает balance_id для покупок в CURRENCY (по умолчанию rub).
+    Структура ответа API может отличаться — перебираем типичные поля.
+    """
+    if not balances_payload or balances_payload.get("_error"):
+        return None
+
+    candidates = []
+    for key in ("balances", "items", "list", "data", "exchange"):
+        val = balances_payload.get(key)
+        if isinstance(val, list):
+            candidates = val
+            break
+        if isinstance(val, dict):
+            # иногда dict id -> info
+            candidates = list(val.values())
+            break
+
+    if not candidates and isinstance(balances_payload, list):
+        candidates = balances_payload
+
+    # если весь payload — один объект баланса
+    if not candidates and any(k in balances_payload for k in ("balance_id", "id", "currency")):
+        candidates = [balances_payload]
+
+    currency_want = CURRENCY.lower()
+    best = None
+    best_amount = -1.0
+
+    for b in candidates:
+        if not isinstance(b, dict):
+            continue
+        bid = b.get("balance_id") or b.get("id") or b.get("balanceId")
+        if bid is None:
+            continue
+        cur = str(
+            b.get("currency") or b.get("currency_code") or b.get("code") or ""
+        ).lower()
+        amount = b.get("amount") or b.get("balance") or b.get("value") or b.get("money") or 0
+        try:
+            amount = float(amount)
+        except Exception:
+            amount = 0.0
+
+        # предпочитаем нужную валюту с максимальным остатком
+        if cur == currency_want or currency_want in cur or cur in currency_want:
+            if amount > best_amount:
+                best_amount = amount
+                best = int(bid)
+        elif best is None and amount > 0:
+            # fallback: любой положительный
+            best = int(bid)
+            best_amount = amount
+
+    return best
+
+
+async def resolve_balance_id() -> int | None:
+    """LOLZ_BALANCE_ID из env или авто из API."""
+    global _cached_balance_id
+    if LOLZ_BALANCE_ID > 0:
+        return LOLZ_BALANCE_ID
+    if _cached_balance_id is not None:
+        return _cached_balance_id
+
+    data = await lolz.get_balances()
+    print(f"[BALANCE] raw keys={list(data.keys()) if isinstance(data, dict) else type(data)}")
+    raw = json.dumps(data, ensure_ascii=False, default=str)
+    print(f"[BALANCE] snippet: {raw[:1000]}")
+
+    bid = _pick_balance_id(data)
+    if bid is None:
+        # пробуем вытащить из /me
+        me = await lolz.get_profile()
+        print(f"[BALANCE /me] snippet: {json.dumps(me, ensure_ascii=False, default=str)[:1000]}")
+        bid = _pick_balance_id(me)
+        if bid is None and isinstance(me.get("user"), dict):
+            bid = _pick_balance_id(me["user"])
+        if bid is None:
+            bid = _pick_balance_id({"balances": me.get("balances") or me.get("balance")})
+
+    _cached_balance_id = bid
+    print(f"[BALANCE] selected balance_id={bid}")
+    return bid
+
+
+def item_price_rub(item: dict) -> float | None:
+    """Достаёт цену лота в рублях (или текущей валюте поиска)."""
+    if not item:
+        return None
+    for key in (
+        "rub_price",
+        "price_rub",
+        "price",
+        "converted_price",
+        "price_with_fee",
+    ):
+        val = item.get(key)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 def is_check_ok(data: dict) -> bool:
     if not data or data.get("_error"):
+        return False
+    if is_insufficient_funds(data):
         return False
     if data.get("status") in ("ok", "success", "valid", True):
         return True
@@ -458,9 +695,9 @@ def is_check_ok(data: dict) -> bool:
         st = str(item.get("status") or item.get("item_state") or "").lower()
         if st in ("active", "validated", "ok", "checked"):
             return True
-    err = str(data.get("error") or data.get("errors") or "")
+    err = extract_errors(data)
     if err and "retry" not in err.lower():
-        bad = ("sold", "deleted", "invalid", "not enough", "blacklist", "limit")
+        bad = ("sold", "deleted", "invalid", "blacklist", "limit")
         if any(b in err.lower() for b in bad):
             return False
     return not data.get("_error")
@@ -473,8 +710,7 @@ def is_buy_ok(data: dict) -> bool:
         return True
     if data.get("status") in ("ok", "success"):
         return True
-    err = str(data.get("error") or "")
-    if err:
+    if extract_errors(data):
         return False
     return True
 
@@ -510,28 +746,85 @@ async def buy_one_account(status_msg, buyer_id: int, seen_ids: set[int], page_st
                 continue
             seen_ids.add(int(item_id))
 
-            price = item.get("price") or item.get("rub_price") or MAX_PRICE
+            price = item_price_rub(item)
+            if price is not None and price > MAX_PRICE:
+                print(f"[SKIP] {item_id} price={price} > MAX_PRICE={MAX_PRICE}")
+                continue
+
             phone_hint = item.get("telegram_phone") or item.get("title") or item_id
+            print(
+                f"[LOT] id={item_id} price={price} "
+                f"keys_price={[k for k in item.keys() if 'price' in k.lower()]}"
+            )
 
             status_msg = await update_status(
                 status_msg,
-                f"🔄 Проверяю лот `{item_id}` ({phone_hint})...",
+                f"🔄 Проверяю лот `{item_id}` (цена {price or '?'} ₽)...",
             )
 
             check = await lolz.check_account(int(item_id))
+            if is_insufficient_funds(check):
+                err = extract_errors(check)
+                print(f"[CHECK NO FUNDS] {item_id}: {err}")
+                return None, status_msg, "no_funds"
+
             if not is_check_ok(check):
-                print(f"[CHECK FAIL] {item_id}: {check.get('error') or check.get('_http')}")
+                err = extract_errors(check) or check.get("_http")
+                print(f"[CHECK FAIL] {item_id}: {err}")
                 continue
+
+            # актуальная цена после check (может быть в ответе)
+            check_item = check.get("item") if isinstance(check.get("item"), dict) else {}
+            price = item_price_rub(check_item) or price
 
             status_msg = await update_status(
                 status_msg,
-                f"✅ Лот `{item_id}` валиден, покупаю...",
+                f"✅ Лот `{item_id}` валиден, покупаю за {price or '?'} ₽...",
             )
 
-            buy = await lolz.fast_buy(int(item_id), price=float(price) if price else None)
+            balance_id = await resolve_balance_id()
+            buy = await lolz.fast_buy(
+                int(item_id),
+                price=float(price) if price is not None else None,
+                balance_id=balance_id,
+            )
+            if is_insufficient_funds(buy):
+                err = extract_errors(buy)
+                print(f"[BUY NO FUNDS] {item_id}: {err} balance_id={balance_id}")
+                # сброс кэша и одна повторная попытка с перечитанным balance_id
+                global _cached_balance_id
+                _cached_balance_id = None
+                balance_id = await resolve_balance_id()
+                buy = await lolz.fast_buy(
+                    int(item_id),
+                    price=float(price) if price is not None else None,
+                    balance_id=balance_id,
+                )
+                if is_insufficient_funds(buy):
+                    print(f"[BUY NO FUNDS2] {item_id}: {extract_errors(buy)} balance_id={balance_id}")
+                    return None, status_msg, "no_funds"
+
             if not is_buy_ok(buy):
-                print(f"[BUY FAIL] {item_id}: {buy.get('error') or buy.get('_http')}")
-                continue
+                err = extract_errors(buy) or buy.get("_http")
+                print(f"[BUY FAIL] {item_id}: {err} balance_id={balance_id}")
+                fresh = await lolz.get_item(int(item_id))
+                fresh_item = fresh.get("item") if isinstance(fresh.get("item"), dict) else fresh
+                fresh_price = item_price_rub(fresh_item) if isinstance(fresh_item, dict) else None
+                if fresh_price and fresh_price != price:
+                    print(f"[BUY RETRY] {item_id} new_price={fresh_price}")
+                    buy = await lolz.fast_buy(
+                        int(item_id),
+                        price=float(fresh_price),
+                        balance_id=balance_id,
+                    )
+                    if is_insufficient_funds(buy):
+                        return None, status_msg, "no_funds"
+                    if not is_buy_ok(buy):
+                        print(f"[BUY FAIL2] {item_id}: {extract_errors(buy) or buy.get('_http')}")
+                        continue
+                    price = fresh_price
+                else:
+                    continue
 
             bought_item = buy.get("item") or buy
             if not extract_session_data(bought_item).get("auth_key"):
@@ -570,15 +863,61 @@ async def buy_one_account(status_msg, buyer_id: int, seen_ids: set[int], page_st
 
 # ====================== MAIN FLOW ======================
 
-async def update_status(status_msg, text: str):
+# pending confirmations: key = f"{user_id}:{msg_id}" -> Future[bool]
+_pending_continue: dict[str, asyncio.Future] = {}
+CONTINUE_TIMEOUT = int(os.environ.get("CONTINUE_TIMEOUT", "300"))  # сек
+
+
+async def update_status(status_msg, text: str, buttons=None):
     try:
-        await status_msg.edit(text)
+        await status_msg.edit(text, buttons=buttons)
         return status_msg
     except Exception:
         try:
-            return await status_msg.respond(text)
+            return await status_msg.respond(text, buttons=buttons)
         except Exception:
             return status_msg
+
+
+async def ask_continue(
+    event,
+    status_msg,
+    text: str,
+    *,
+    buyer_id: int,
+) -> tuple[bool, object]:
+    """
+    Показать кнопки «Купить следующий» / «Стоп».
+    True  — юзер нажал продолжить
+    False — стоп / таймаут
+    """
+    buttons = [
+        [
+            Button.inline("✅ Купить следующий", data=b"cont:yes"),
+            Button.inline("🛑 Стоп", data=b"cont:no"),
+        ]
+    ]
+    status_msg = await update_status(status_msg, text, buttons=buttons)
+
+    key = f"{buyer_id}:{status_msg.id}"
+    loop = asyncio.get_event_loop()
+    fut: asyncio.Future = loop.create_future()
+    _pending_continue[key] = fut
+
+    try:
+        ok = await asyncio.wait_for(fut, timeout=CONTINUE_TIMEOUT)
+        return bool(ok), status_msg
+    except asyncio.TimeoutError:
+        try:
+            await status_msg.edit(
+                text + f"\n\n⏱ Таймаут {CONTINUE_TIMEOUT}с — остановлено.",
+                buttons=None,
+            )
+        except Exception:
+            pass
+        return False, status_msg
+    finally:
+        _pending_continue.pop(key, None)
 
 
 async def process_verification(event, start_param: str):
@@ -609,6 +948,17 @@ async def process_verification(event, start_param: str):
             )
             await asyncio.sleep(5)
             continue
+
+        if reason == "no_funds":
+            status_msg = await update_status(
+                status_msg,
+                "💸 API: недостаточно средств.\n\n"
+                "После сплита балансов нужен `balance_id`.\n"
+                "Смотри в логах Railway строки `[BALANCE]`.\n"
+                "Можно задать вручную env `LOLZ_BALANCE_ID=...`",
+            )
+            await log_event(bot, "ERROR", "—", buyer_id, extra="insufficient funds / balance_id")
+            return
 
         if reason == "no_items" or sess is None:
             status_msg = await update_status(
@@ -648,7 +998,6 @@ async def process_verification(event, start_param: str):
                 await archive_account(
                     bot, "ERROR", phone, auth_key, dc_id, tg_uid, None, buyer_id, str(e2)
                 )
-                # считаем как DEAD-подобное → claim + следующий
                 if AUTO_CLAIM_ON_DEAD:
                     claim = await lolz.create_claim(item_id, CLAIM_TEXT_DEAD + f"\nItem ID: {item_id}")
                     await log_event(
@@ -659,6 +1008,16 @@ async def process_verification(event, start_param: str):
                         session_name=session_name,
                         extra=f"claim={not claim.get('_error')} item={item_id}",
                     )
+                go, status_msg = await ask_continue(
+                    event,
+                    status_msg,
+                    f"💀 **DEAD** (не собралась session) — `{phone}`\n"
+                    f"Попытка {tried}/{MAX_TRIES}. Купить следующий?",
+                    buyer_id=buyer_id,
+                )
+                if not go:
+                    await update_status(status_msg, f"🛑 Остановлено после DEAD `{phone}`.")
+                    return
                 continue
 
         result = await check_mamba_with_session(
@@ -680,7 +1039,7 @@ async def process_verification(event, start_param: str):
             cleanup_session_file(session_path)
             return
 
-        # --- NOVALID: архив + следующий номер ---
+        # --- NOVALID: архив + спросить продолжать ли ---
         if result == "NOVALID":
             await log_event(
                 bot,
@@ -688,19 +1047,26 @@ async def process_verification(event, start_param: str):
                 phone,
                 buyer_id,
                 session_name=session_name,
-                extra=f"item={item_id}, беру следующий",
+                extra=f"item={item_id}",
             )
             await archive_account(
                 bot, "NOVALID", phone, auth_key, dc_id, tg_uid, session_path, buyer_id
             )
             cleanup_session_file(session_path)
-            status_msg = await update_status(
+            go, status_msg = await ask_continue(
+                event,
                 status_msg,
-                f"❌ NOVALID — `{phone}`\nБеру следующий аккаунт...",
+                f"❌ **NOVALID** — `{phone}` (item `{item_id}`)\n\n"
+                f"Попытка {tried}/{MAX_TRIES}. Купить следующий аккаунт?",
+                buyer_id=buyer_id,
             )
+            if not go:
+                await update_status(status_msg, f"🛑 Остановлено после NOVALID `{phone}`.")
+                await log_event(bot, "STOP", phone, buyer_id, extra="user stop after NOVALID")
+                return
             continue
 
-        # --- DEAD: claim (замена/возврат) + архив + следующий ---
+        # --- DEAD: claim + спросить ---
         if result == "DEAD":
             claim_ok = False
             if AUTO_CLAIM_ON_DEAD:
@@ -731,15 +1097,21 @@ async def process_verification(event, start_param: str):
                 extra=f"claim={'ok' if claim_ok else 'fail'}",
             )
             cleanup_session_file(session_path)
-            status_msg = await update_status(
+            claim_line = "Претензия отправлена." if claim_ok else "Претензия не создалась."
+            go, status_msg = await ask_continue(
+                event,
                 status_msg,
-                f"💀 DEAD — `{phone}`\n"
-                f"{'Претензия отправлена. ' if claim_ok else 'Претензия не создалась. '}"
-                f"Беру следующий...",
+                f"💀 **DEAD** — `{phone}` (item `{item_id}`)\n{claim_line}\n\n"
+                f"Попытка {tried}/{MAX_TRIES}. Купить следующий?",
+                buyer_id=buyer_id,
             )
+            if not go:
+                await update_status(status_msg, f"🛑 Остановлено после DEAD `{phone}`.")
+                await log_event(bot, "STOP", phone, buyer_id, extra="user stop after DEAD")
+                return
             continue
 
-        # --- ERROR: архив + следующий ---
+        # --- ERROR: архив + спросить ---
         await log_event(
             bot,
             "ERROR",
@@ -752,10 +1124,17 @@ async def process_verification(event, start_param: str):
             bot, "ERROR", phone, auth_key, dc_id, tg_uid, session_path, buyer_id
         )
         cleanup_session_file(session_path)
-        status_msg = await update_status(
+        go, status_msg = await ask_continue(
+            event,
             status_msg,
-            f"⚠️ ERROR — `{phone}`\nБеру следующий...",
+            f"⚠️ **ERROR** — `{phone}` (item `{item_id}`)\n\n"
+            f"Попытка {tried}/{MAX_TRIES}. Купить следующий?",
+            buyer_id=buyer_id,
         )
+        if not go:
+            await update_status(status_msg, f"🛑 Остановлено после ERROR `{phone}`.")
+            await log_event(bot, "STOP", phone, buyer_id, extra="user stop after ERROR")
+            return
 
     # исчерпали попытки
     await update_status(
@@ -774,12 +1153,57 @@ bot = TelegramClient("bot_session", API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 @bot.on(events.NewMessage(pattern=r"^/start$"))
 async def start_cmd(event):
     await event.reply(
-        "Пришли ссылку для **автоматической** верификации Мамбы.\n\n"
-        "Бот сам купит Telegram-аккаунт на Lolz (до 7 ₽, без пароля/2FA, свежий),\n"
-        "соберёт session и подтвердит анкету.\n\n"
-        "• NOVALID → следующий аккаунт\n"
-        "• DEAD → претензия (замена/возврат) + следующий"
+        "Пришли ссылку для верификации Мамбы.\n\n"
+        "Бот купит Telegram-аккаунт на Lolz (до 7 ₽, без пароля/2FA, свежий),\n"
+        "соберёт session и проверит анкету.\n\n"
+        "• **VALID** — готово\n"
+        "• **NOVALID / DEAD / ERROR** — кнопки «Купить следующий» / «Стоп»\n"
+        "  (деньги не тратятся без твоего подтверждения)"
     )
+
+
+@bot.on(events.CallbackQuery(pattern=rb"^cont:(yes|no)$"))
+async def on_continue_callback(event):
+    """Обработка кнопок продолжения покупки."""
+    data = event.data.decode()
+    buyer_id = event.sender_id
+    msg_id = event.message_id
+    key = f"{buyer_id}:{msg_id}"
+    fut = _pending_continue.get(key)
+
+    # также ищем по любому pending этого юзера (на случай edit id)
+    if fut is None:
+        for k, f in list(_pending_continue.items()):
+            if k.startswith(f"{buyer_id}:") and not f.done():
+                fut = f
+                key = k
+                break
+
+    ok = data.endswith("yes")
+    if fut is not None and not fut.done():
+        fut.set_result(ok)
+
+    try:
+        if ok:
+            await event.answer("Ищем следующий аккаунт...")
+            try:
+                await event.edit(
+                    (event.message.message or "") + "\n\n▶️ Продолжаем...",
+                    buttons=None,
+                )
+            except Exception:
+                pass
+        else:
+            await event.answer("Остановлено")
+            try:
+                await event.edit(
+                    (event.message.message or "") + "\n\n🛑 Остановлено.",
+                    buttons=None,
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[CALLBACK] {e}")
 
 
 @bot.on(events.NewMessage(pattern=r"(?i).*(tg://|start=|mambarubot)"))
@@ -804,4 +1228,43 @@ print(
     f"MAX_PRICE={MAX_PRICE} MAX_TRIES={MAX_TRIES} "
     f"CURRENCY={CURRENCY} AUTO_CLAIM_ON_DEAD={AUTO_CLAIM_ON_DEAD}"
 )
+print(f"LOG_SUPERGROUP_ID={LOG_SUPERGROUP_ID}")
+
+
+async def _startup():
+    try:
+        ent = await resolve_log_chat(bot)
+        print(f"[STARTUP] log chat ok: {ent}")
+    except Exception as e:
+        print(f"[STARTUP] log chat resolve failed: {e}")
+        print(
+            "Проверь:\n"
+            "1) Бот добавлен в супергруппу и является админом\n"
+            "2) LOG_SUPERGROUP_ID верный (лучше -100XXXXXXXXXX)\n"
+            "3) У бота есть право писать в топики"
+        )
+
+    try:
+        me = await lolz.get_profile()
+        if me.get("_error"):
+            print(f"[LOLZ /me] error: {me}")
+        else:
+            user = me.get("user") or me.get("me") or me
+            uid = uname = None
+            if isinstance(user, dict):
+                uid = user.get("user_id") or user.get("userId")
+                uname = user.get("username")
+            print(f"[LOLZ /me] user_id={uid} username={uname}")
+            print(f"[LOLZ /me] snippet: {json.dumps(me, ensure_ascii=False, default=str)[:800]}")
+    except Exception as e:
+        print(f"[LOLZ /me] failed: {e}")
+
+    try:
+        bid = await resolve_balance_id()
+        print(f"[STARTUP] balance_id={bid} (env LOLZ_BALANCE_ID={LOLZ_BALANCE_ID})")
+    except Exception as e:
+        print(f"[STARTUP] balance resolve failed: {e}")
+
+
+bot.loop.run_until_complete(_startup())
 bot.run_until_disconnected()
