@@ -5,8 +5,11 @@ import asyncio
 import tempfile
 import struct
 import base64
+import ipaddress
 from pathlib import Path
 from datetime import datetime
+from dataclasses import dataclass
+from typing import ClassVar, Mapping
 
 import aiohttp
 from telethon import TelegramClient, events, Button
@@ -263,30 +266,163 @@ lolz = LolzAPI(LOLZ_TOKEN)
 
 # ====================== SESSION FROM AUTH KEY ======================
 
+def _normalize_auth_hex(raw: str) -> str:
+    s = str(raw).strip().replace(" ", "").replace("\n", "").replace("\r", "")
+    if s.lower().startswith("0x"):
+        s = s[2:]
+    s = re.sub(r"[^0-9a-fA-F]", "", s)
+    return s
+
+
+@dataclass(frozen=True)
+class TelegramSessionEncoder:
+    """
+    Модуль от поддержки Lolz Market.
+    Строит StringSession из auth_key (256 bytes) + dc_id.
+    """
+    auth_key: bytes
+    dc_id: int
+
+    _VERSION: ClassVar[str] = "1"
+    _PORT: ClassVar[int] = 443
+    _DC_IP_MAP: ClassVar[Mapping[int, str]] = {
+        1: "149.154.175.53",
+        2: "149.154.167.51",
+        3: "149.154.175.100",
+        4: "149.154.167.91",
+        5: "91.108.56.130",
+    }
+
+    def to_string(self) -> str:
+        ip_bytes = self._resolve_ip()
+        payload = self._build_payload(ip_bytes)
+        encoded = base64.urlsafe_b64encode(payload).decode("ascii")
+        return f"{self._VERSION}{encoded}"
+
+    def _resolve_ip(self) -> bytes:
+        ip = self._DC_IP_MAP.get(self.dc_id)
+        if not ip:
+            raise ValueError(f"Unknown data center ID: {self.dc_id}")
+        return ipaddress.ip_address(ip).packed
+
+    def _build_payload(self, ip_bytes: bytes) -> bytes:
+        if len(self.auth_key) != 256:
+            raise ValueError("auth_key must be exactly 256 bytes")
+        fmt = f">B{len(ip_bytes)}sH256s"
+        return struct.pack(fmt, self.dc_id, ip_bytes, self._PORT, self.auth_key)
+
+
 def authkey_to_string_session(auth_key_hex: str, dc_id: int) -> str:
-    auth_key_hex = auth_key_hex.strip().replace(" ", "").replace("\n", "")
-    if auth_key_hex.lower().startswith("0x"):
-        auth_key_hex = auth_key_hex[2:]
-    key = bytes.fromhex(auth_key_hex)
+    """Собираем Telethon StringSession (как веб-маркет / модуль поддержки)."""
+    hex_key = _normalize_auth_hex(auth_key_hex)
+    key = bytes.fromhex(hex_key)
     if len(key) != 256:
         raise ValueError(f"auth_key must be 256 bytes, got {len(key)}")
+    return TelegramSessionEncoder(auth_key=key, dc_id=int(dc_id)).to_string()
 
-    ip = DC_IP_MAP.get(int(dc_id))
-    if not ip:
-        raise ValueError(f"unknown dc_id: {dc_id}")
 
-    ip_bytes = ip.encode("ascii")
-    pack = struct.pack(
-        f">B{len(ip_bytes)}sH256s",
-        int(dc_id),
-        ip_bytes,
-        DC_PORT,
-        key,
-    )
-    return "1" + base64.urlsafe_b64encode(pack).decode("ascii")
+def _walk_find_auth(obj, found=None, depth=0):
+    """Рекурсивно ищет auth_key (hex ~512 символов) и dc_id в любом JSON."""
+    if found is None:
+        found = {"auth_key": None, "dc_id": None, "phone": None, "user_id": None}
+    if depth > 8 or obj is None:
+        return found
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            kl = str(k).lower()
+            if v is None or v == "" or v == []:
+                continue
+            # прямые ключи
+            if kl in (
+                "auth_key", "authkey", "auth_key_hex", "authkeyhex",
+                "telegram_auth_key", "session_key", "authkeyhex",
+            ) and isinstance(v, str) and len(re.sub(r"[^0-9a-fA-F]", "", v)) >= 64:
+                found["auth_key"] = v
+            if kl in ("dc_id", "dcid", "telegram_dc_id", "data_center", "dc") and str(v).isdigit():
+                if 1 <= int(v) <= 5:
+                    found["dc_id"] = int(v)
+            if kl in ("telegram_phone", "phone", "tel", "accountphone") and not found["phone"]:
+                found["phone"] = str(v)
+            if kl in ("telegram_id", "telegramid", "user_id", "userid") and not found["user_id"]:
+                if str(v).isdigit() and len(str(v)) >= 5:
+                    found["user_id"] = str(v)
+            # login/password паттерн маркета для TG
+            if kl == "login" and isinstance(v, str):
+                hexpart = re.sub(r"[^0-9a-fA-F]", "", v)
+                if len(hexpart) >= 64:
+                    found["auth_key"] = found["auth_key"] or v
+                elif re.search(r"\d{10,15}", v) and not found["phone"]:
+                    found["phone"] = v
+            if kl == "password" and isinstance(v, (str, int)):
+                s = str(v).strip()
+                if s.isdigit() and 1 <= int(s) <= 5:
+                    found["dc_id"] = found["dc_id"] or int(s)
+                hexpart = re.sub(r"[^0-9a-fA-F]", "", s)
+                if len(hexpart) >= 64:
+                    found["auth_key"] = found["auth_key"] or s
+            # значения вида "5:hex..." или "hex:5"
+            if isinstance(v, str) and ":" in v:
+                parts = v.split(":")
+                if len(parts) == 2:
+                    a, b = parts[0].strip(), parts[1].strip()
+                    if a.isdigit() and 1 <= int(a) <= 5 and len(re.sub(r"[^0-9a-fA-F]", "", b)) >= 64:
+                        found["dc_id"] = found["dc_id"] or int(a)
+                        found["auth_key"] = found["auth_key"] or b
+                    elif b.isdigit() and 1 <= int(b) <= 5 and len(re.sub(r"[^0-9a-fA-F]", "", a)) >= 64:
+                        found["auth_key"] = found["auth_key"] or a
+                        found["dc_id"] = found["dc_id"] or int(b)
+            # длинная hex-строка без ключа
+            if isinstance(v, str):
+                hexpart = re.sub(r"[^0-9a-fA-F]", "", v)
+                if len(hexpart) in (512, 256) or (len(hexpart) >= 500 and len(hexpart) <= 520):
+                    found["auth_key"] = found["auth_key"] or hexpart
+            _walk_find_auth(v, found, depth + 1)
+    elif isinstance(obj, list):
+        for x in obj[:50]:
+            _walk_find_auth(x, found, depth + 1)
+    return found
+
+
+def _parse_telegram_json(raw) -> dict:
+    """
+    Поддержка: telegram_json — строка JSON (как сказал support Lolz).
+    Также dict / уже распарсенный объект.
+    """
+    if raw is None or raw == "" or raw == "?":
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, (bytes, bytearray)):
+        try:
+            raw = raw.decode("utf-8", errors="ignore")
+        except Exception:
+            return {}
+    if not isinstance(raw, str):
+        return {}
+    s = raw.strip()
+    # иногда двойной encode
+    for _ in range(2):
+        try:
+            obj = json.loads(s)
+        except Exception:
+            return {}
+        if isinstance(obj, str):
+            s = obj.strip()
+            continue
+        if isinstance(obj, dict):
+            return obj
+        return {}
+    return {}
 
 
 def extract_session_data(item: dict) -> dict:
+    """
+    Support Lolz:
+      session через API не скачивается;
+      данные в item['telegram_json'] (string JSON);
+      session собираем сами из auth_key + dc_id.
+    """
     if not item:
         return {}
 
@@ -296,41 +432,116 @@ def extract_session_data(item: dict) -> dict:
             login = json.loads(login)
         except Exception:
             login = {"raw": login}
+    if not isinstance(login, dict):
+        login = {}
+
+    # --- 1) ГЛАВНЫЙ ИСТОЧНИК (support): item['telegram_json'] как строка JSON ---
+    tg_json_raw = (
+        item.get("telegram_json")
+        or item.get("telegramJson")
+        or item.get("telegram_json_data")
+        or login.get("telegram_json")
+        or login.get("telegramJson")
+        or login.get("json")
+    )
+    tg = _parse_telegram_json(tg_json_raw)
+    if tg:
+        print(f"[telegram_json] keys={list(tg.keys())[:30]}")
+        print(f"[telegram_json] snippet={json.dumps(tg, ensure_ascii=False, default=str)[:400]}")
+    else:
+        print(
+            f"[telegram_json] EMPTY "
+            f"item_has={bool(item.get('telegram_json') or item.get('telegramJson'))} "
+            f"login_has={bool(login.get('telegram_json') or login.get('telegramJson'))}"
+        )
+
+    sources = [tg, login, item]
 
     def dig(*keys, default=None):
-        for src in (item, login):
+        for src in sources:
             if not isinstance(src, dict):
                 continue
             for k in keys:
-                if k in src and src[k] not in (None, "", []):
+                if k in src and src[k] not in (None, "", [], "?"):
                     return src[k]
+                # case-insensitive
+                for sk, sv in src.items():
+                    if str(sk).lower() == k.lower() and sv not in (None, "", [], "?"):
+                        return sv
         return default
 
-    phone = dig("telegram_phone", "phone", "login", "accountPhone", "tel", default="")
-    phone = re.sub(r"[^\d+]", "", str(phone)) if phone else ""
-
-    user_id = dig("telegram_id", "user_id", "telegramId", "userId")
-    dc_id = dig("dc_id", "dcId", "telegram_dc_id", "data_center")
+    phone = dig(
+        "phone", "telegram_phone", "tel", "accountPhone", "number", "msisdn",
+        default="",
+    )
+    user_id = dig(
+        "user_id", "userId", "telegram_id", "telegramId", "id", "uid",
+    )
+    dc_id = dig(
+        "dc_id", "dcId", "dc", "telegram_dc_id", "data_center", "dataCenter",
+    )
     auth_key = dig(
         "auth_key", "authKey", "auth_key_hex", "authKeyHex",
-        "telegram_auth_key", "session", "session_key",
+        "telegram_auth_key", "session_key", "key", "auth",
     )
 
-    if isinstance(auth_key, str) and ":" in auth_key and not dc_id:
+    # иногда auth лежит в login/password
+    if not auth_key:
+        for cand in (dig("login"), dig("password"), login.get("login"), login.get("password")):
+            if isinstance(cand, str) and len(_normalize_auth_hex(cand)) >= 64:
+                auth_key = cand
+                break
+
+    # формат "dc:hex" / "hex:dc"
+    if isinstance(auth_key, str) and ":" in auth_key:
         parts = auth_key.split(":")
         if len(parts) == 2:
             a, b = parts[0].strip(), parts[1].strip()
-            if a.isdigit() and len(b) > 32:
-                dc_id, auth_key = a, b
-            elif b.isdigit() and len(a) > 32:
-                auth_key, dc_id = a, b
+            ha, hb = _normalize_auth_hex(a), _normalize_auth_hex(b)
+            if a.isdigit() and 1 <= int(a) <= 5 and len(hb) >= 64:
+                dc_id, auth_key = int(a), b
+            elif b.isdigit() and 1 <= int(b) <= 5 and len(ha) >= 64:
+                auth_key, dc_id = a, int(b)
+
+    # fallback deep walk
+    if not auth_key or not dc_id:
+        deep = _walk_find_auth({"telegram_json": tg, "loginData": login, "item": item})
+        auth_key = auth_key or deep.get("auth_key")
+        dc_id = dc_id or deep.get("dc_id")
+        phone = phone or deep.get("phone") or ""
+        user_id = user_id or deep.get("user_id")
+
+    if not dc_id and item.get("telegram_dc_id"):
+        try:
+            dc_id = int(item["telegram_dc_id"])
+        except Exception:
+            pass
+
+    if phone:
+        phone = re.sub(r"[^\d+]", "", str(phone))
+    else:
+        phone = ""
+
+    auth_clean = _normalize_auth_hex(auth_key) if auth_key else None
+    if auth_clean and len(auth_clean) not in (512, 256) and len(auth_clean) < 64:
+        auth_clean = None
+    # 256 hex chars = 128 bytes — иногда ключ укорочен; 512 = 256 bytes — норма
+    if auth_clean and len(auth_clean) == 256:
+        # некоторые отдают 128-byte key как hex256 — Telethon ждёт 256 bytes (512 hex)
+        print(f"[extract] auth_key len=256 hex (128 bytes) — может быть неполным")
+
+    try:
+        dc_id = int(dc_id) if dc_id not in (None, "") else None
+    except Exception:
+        dc_id = None
 
     return {
         "phone": str(phone or ""),
-        "user_id": str(user_id or ""),
-        "dc_id": int(dc_id) if dc_id not in (None, "") else None,
-        "auth_key": str(auth_key).strip() if auth_key else None,
+        "user_id": str(user_id or "") if user_id not in (None, "") else "",
+        "dc_id": dc_id,
+        "auth_key": auth_clean,
         "raw_item": item,
+        "telegram_json": tg,
     }
 
 
@@ -339,8 +550,18 @@ def write_sqlite_session(path: Path, auth_key_hex: str, dc_id: int) -> Path:
     if path.suffix != ".session":
         path = path.with_suffix(".session")
 
-    key = bytes.fromhex(auth_key_hex.strip().replace(" ", ""))
+    hex_key = _normalize_auth_hex(auth_key_hex)
+    key = bytes.fromhex(hex_key)
+    if len(key) != 256:
+        raise ValueError(f"auth_key must be 256 bytes, got {len(key)}")
     ip = DC_IP_MAP[int(dc_id)]
+
+    # удалить старый файл если есть
+    try:
+        path.unlink(missing_ok=True)
+        Path(str(path) + "-journal").unlink(missing_ok=True)
+    except Exception:
+        pass
 
     session = SQLiteSession(str(path.with_suffix("")))
     session.set_dc(int(dc_id), ip, DC_PORT)
@@ -428,6 +649,67 @@ async def log_event(
     await send_to_topic(bot_client, TOPIC_LOGS, text)
 
 
+async def build_session_artifacts(
+    phone: str,
+    item_id,
+    auth_key: str | None,
+    dc_id: int | None,
+    tg_user_id: str = "",
+    status: str = "",
+    buyer_id: int = 0,
+    extra: str = "",
+) -> tuple[Path | None, Path | None, str | None]:
+    """
+    Всегда создаёт:
+      - .session (Telethon SQLite)
+      - .json  (phone, auth_key, dc_id, user_id, string_session, ...)
+    Возвращает (session_path, json_path, string_session).
+    """
+    safe_phone = re.sub(r"[^\d]", "", str(phone or "")) or "unknown"
+    base = TEMP_DIR / f"{safe_phone}_{item_id or 'x'}_{status or 'acc'}"
+    session_path = base.with_suffix(".session")
+    json_path = base.with_suffix(".json")
+    string_session = None
+
+    if auth_key and dc_id:
+        try:
+            string_session = authkey_to_string_session(auth_key, int(dc_id))
+        except Exception as e:
+            print(f"[ARCHIVE] StringSession fail: {e}")
+        try:
+            write_sqlite_session(session_path, auth_key, int(dc_id))
+            print(f"[ARCHIVE] session file: {session_path}")
+        except Exception as e:
+            print(f"[ARCHIVE] sqlite fail: {e}")
+            session_path = None
+    else:
+        session_path = None
+
+    meta = {
+        "status": status,
+        "phone": phone,
+        "user_id": tg_user_id,
+        "dc_id": dc_id,
+        "auth_key": auth_key,
+        "string_session": string_session,
+        "item_id": item_id,
+        "buyer_id": buyer_id,
+        "extra": extra,
+        "time": now_str(),
+    }
+    try:
+        json_path.write_text(
+            json.dumps(meta, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"[ARCHIVE] json file: {json_path}")
+    except Exception as e:
+        print(f"[ARCHIVE] json fail: {e}")
+        json_path = None
+
+    return session_path, json_path, string_session
+
+
 async def archive_account(
     bot_client: TelegramClient,
     status: str,
@@ -438,7 +720,12 @@ async def archive_account(
     session_path: Path | None,
     buyer_id: int = 0,
     extra: str = "",
+    item_id=None,
 ):
+    """
+    Архив в топик VALID/NOVALID/DEAD/ERROR:
+      текст + файл .session + файл .json (auth_key, dc, phone, string_session).
+    """
     topic_map = {
         "VALID": TOPIC_VALID,
         "NOVALID": TOPIC_NOVALID,
@@ -447,24 +734,74 @@ async def archive_account(
     }
     topic = topic_map.get(status, TOPIC_ERROR)
 
+    # гарантированно собираем файлы (даже если session_path не передали)
+    built_session, json_path, string_session = await build_session_artifacts(
+        phone=phone,
+        item_id=item_id or phone,
+        auth_key=auth_key,
+        dc_id=dc_id,
+        tg_user_id=tg_user_id,
+        status=status,
+        buyer_id=buyer_id,
+        extra=extra,
+    )
+    if built_session and built_session.exists():
+        session_path = built_session
+    elif session_path and not Path(session_path).exists():
+        session_path = None
+
+    # caption короткий (лимит TG ~1024 для media)
     text = (
         f"**ARCHIVE · {status}**\n\n"
         f"📞 Phone: `{phone or '—'}`\n"
         f"🆔 TG User ID: `{tg_user_id or '—'}`\n"
-        f"🔑 Auth Key (HEX):\n`{auth_key or '—'}`\n"
         f"📡 DC ID: `{dc_id or '—'}`\n"
+        f"📦 Item: `{item_id or '—'}`\n"
         f"👤 Buyer: `{buyer_id}`\n"
         f"🕒 `{now_str()}`\n"
         f"#{status}"
     )
     if extra:
         text += f"\nℹ️ {extra}"
+    if auth_key:
+        # не целиком в caption — обрежем, полный в .json
+        ak = auth_key if len(auth_key) <= 64 else (auth_key[:24] + "…" + auth_key[-24:])
+        text += f"\n🔑 Auth: `{ak}`"
 
-    file_arg = None
+    files = []
     if session_path and Path(session_path).exists():
-        file_arg = str(session_path)
+        files.append(str(session_path))
+    if json_path and Path(json_path).exists():
+        files.append(str(json_path))
 
-    await send_to_topic(bot_client, topic, text, file=file_arg)
+    print(f"[ARCHIVE] status={status} topic={topic} files={files}")
+
+    if files:
+        # сначала session, потом json — двумя сообщениями надёжнее
+        await send_to_topic(bot_client, topic, text, file=files[0])
+        for f in files[1:]:
+            await send_to_topic(
+                bot_client,
+                topic,
+                f"📎 meta `{Path(f).name}` · {status} · `{phone}`",
+                file=f,
+            )
+    else:
+        # файлов нет — хотя бы текст + полный auth
+        long_text = text
+        if auth_key:
+            long_text += f"\n\n🔑 Auth Key (HEX):\n`{auth_key}`"
+        if string_session:
+            long_text += f"\n\n🧵 StringSession:\n`{string_session[:200]}…`"
+        await send_to_topic(bot_client, topic, long_text)
+
+    # подчистить временные
+    cleanup_session_file(session_path)
+    if json_path:
+        try:
+            Path(json_path).unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ====================== MAMBA CHECK ======================
@@ -1005,19 +1342,58 @@ async def buy_one_account(status_msg, buyer_id: int, seen_ids: set[int], page_st
                     continue
 
             bought_item = buy.get("item") or buy
-            if not extract_session_data(bought_item).get("auth_key"):
-                full = await lolz.get_item(int(item_id))
-                if full.get("item"):
-                    bought_item = full["item"]
-                elif not full.get("_error"):
-                    bought_item = {**bought_item, **full}
+            try:
+                if isinstance(bought_item, dict):
+                    print(f"[BUY OK keys] item={item_id} keys={list(bought_item.keys())[:60]}")
+                    tj = bought_item.get("telegram_json") or bought_item.get("telegramJson")
+                    if tj is not None:
+                        print(f"[BUY OK telegram_json type={type(tj).__name__}] {str(tj)[:500]}")
+                    for lk in ("loginData", "login_data", "telegramData"):
+                        if bought_item.get(lk) is not None:
+                            print(
+                                f"[BUY OK {lk}] "
+                                f"{json.dumps(bought_item.get(lk), ensure_ascii=False, default=str)[:400]}"
+                            )
+            except Exception as e:
+                print(f"[BUY OK dump fail] {e}")
 
-            sess = extract_session_data(bought_item)
+            sess = extract_session_data(bought_item if isinstance(bought_item, dict) else {})
+            # после покупки telegram_json может появиться только в GET
+            if not sess.get("auth_key") or not sess.get("dc_id"):
+                await asyncio.sleep(1.2)
+                full = await lolz.get_item(int(item_id))
+                print(
+                    f"[GET ITEM after buy] top_keys="
+                    f"{list(full.keys()) if isinstance(full, dict) else type(full)}"
+                )
+                full_item = full.get("item") if isinstance(full.get("item"), dict) else (
+                    full if isinstance(full, dict) and not full.get("_error") else {}
+                )
+                if isinstance(full_item, dict):
+                    print(f"[GET ITEM item keys] {list(full_item.keys())[:60]}")
+                    tj = full_item.get("telegram_json") or full_item.get("telegramJson")
+                    if tj is not None:
+                        print(f"[GET ITEM telegram_json] {str(tj)[:600]}")
+                    bought_item = {**(bought_item if isinstance(bought_item, dict) else {}), **full_item}
+                sess = extract_session_data(bought_item if isinstance(bought_item, dict) else {})
+
+            # dc с исходного лота, если API не отдал после покупки
+            if not sess.get("dc_id") and item.get("telegram_dc_id"):
+                try:
+                    sess["dc_id"] = int(item["telegram_dc_id"])
+                except Exception:
+                    pass
+            if not sess.get("phone") and item.get("telegram_phone"):
+                sess["phone"] = re.sub(r"[^\d+]", "", str(item["telegram_phone"]))
+
             sess["item_id"] = int(item_id)
             sess["price"] = price
 
             if not sess.get("auth_key") or not sess.get("dc_id"):
-                print(f"[NO AUTH KEY] item={item_id}")
+                print(
+                    f"[NO AUTH KEY] item={item_id} "
+                    f"auth={bool(sess.get('auth_key'))} dc={sess.get('dc_id')}"
+                )
                 await log_event(
                     bot,
                     "ERROR",
@@ -1025,7 +1401,8 @@ async def buy_one_account(status_msg, buyer_id: int, seen_ids: set[int], page_st
                     buyer_id,
                     extra=f"нет auth_key/dc_id item={item_id}",
                 )
-                continue
+                # не жжём баланс в цикле — отдаём управление наверх
+                return sess, status_msg, "no_auth"
 
             page_state["page"] = page
             return sess, status_msg, "ok"
@@ -1162,6 +1539,22 @@ async def process_verification(event, start_param: str):
             await log_event(bot, "ERROR", "—", buyer_id, extra="insufficient funds / balance_id")
             return
 
+        if reason == "no_auth":
+            phone_x = (sess or {}).get("phone") or "—"
+            item_x = (sess or {}).get("item_id") or "?"
+            go, status_msg = await ask_continue(
+                event,
+                status_msg,
+                f"⚠️ Куплен item `{item_x}` (`{phone_x}`), но **нет auth_key/dc_id** в ответе API.\n"
+                f"Смотри логи `[BUY OK]` / `[GET ITEM]`.\n\n"
+                f"Попытка {tried}/{MAX_TRIES}. Купить следующий?",
+                buyer_id=buyer_id,
+            )
+            if not go:
+                await update_status(status_msg, "🛑 Остановлено (нет auth_key).")
+                return
+            continue
+
         if reason == "no_items" or sess is None:
             status_msg = await update_status(
                 status_msg,
@@ -1182,48 +1575,58 @@ async def process_verification(event, start_param: str):
             f"Подключаю session и проверяю Mamba...",
         )
 
-        # build session
+        # build session из auth_key + dc_id (как веб-маркет)
+        print(
+            f"[SESSION BUILD] phone={phone} dc={dc_id} "
+            f"auth_len={len(auth_key) if auth_key else 0}"
+        )
         session_path = TEMP_DIR / f"{phone or item_id}_{item_id}.session"
         string_session = None
         session_name = session_path.name
         try:
-            write_sqlite_session(session_path, auth_key, dc_id)
+            string_session = authkey_to_string_session(auth_key, dc_id)
+            print(f"[SESSION BUILD] StringSession ok len={len(string_session)}")
         except Exception as e:
-            print(f"[SESSION FILE] {e}, fallback StringSession")
-            try:
-                string_session = authkey_to_string_session(auth_key, dc_id)
-                session_name = f"{phone or item_id}.string"
-                cleanup_session_file(session_path)
-                session_path = None
-            except Exception as e2:
-                await log_event(bot, "ERROR", phone, buyer_id, extra=str(e2))
-                await archive_account(
-                    bot, "ERROR", phone, auth_key, dc_id, tg_uid, None, buyer_id, str(e2)
-                )
-                if AUTO_CLAIM_ON_DEAD:
-                    claim = await lolz.create_claim(item_id, CLAIM_TEXT_DEAD + f"\nItem ID: {item_id}")
-                    await log_event(
-                        bot,
-                        "DEAD",
-                        phone,
-                        buyer_id,
-                        session_name=session_name,
-                        extra=f"claim={not claim.get('_error')} item={item_id}",
-                    )
-                go, status_msg = await ask_continue(
-                    event,
-                    status_msg,
-                    f"💀 **DEAD** (не собралась session) — `{phone}`\n"
-                    f"Попытка {tried}/{MAX_TRIES}. Купить следующий?",
-                    buyer_id=buyer_id,
-                )
-                if not go:
-                    await update_status(status_msg, f"🛑 Остановлено после DEAD `{phone}`.")
-                    return
-                continue
+            print(f"[SESSION BUILD] StringSession fail: {e}")
+            string_session = None
 
+        try:
+            write_sqlite_session(session_path, auth_key, dc_id)
+            print(f"[SESSION BUILD] SQLite ok path={session_path}")
+        except Exception as e:
+            print(f"[SESSION BUILD] SQLite fail: {e}")
+            cleanup_session_file(session_path)
+            session_path = None
+
+        if not string_session and not session_path:
+            await log_event(bot, "ERROR", phone, buyer_id, extra="session build failed")
+            await archive_account(
+                bot,
+                "ERROR",
+                phone,
+                auth_key,
+                dc_id,
+                tg_uid,
+                None,
+                buyer_id,
+                "session build failed",
+                item_id=item_id,
+            )
+            go, status_msg = await ask_continue(
+                event,
+                status_msg,
+                f"⚠️ Не собралась session для `{phone}` (item `{item_id}`).\n"
+                f"Попытка {tried}/{MAX_TRIES}. Купить следующий?",
+                buyer_id=buyer_id,
+            )
+            if not go:
+                await update_status(status_msg, "🛑 Остановлено — session build fail.")
+                return
+            continue
+
+        # приоритет StringSession (не зависит от файловой системы Railway)
         result = await check_mamba_with_session(
-            session_path=session_path,
+            session_path=None if string_session else session_path,
             string_session=string_session,
             start_param=start_param,
         )
@@ -1237,12 +1640,19 @@ async def process_verification(event, start_param: str):
             )
             await log_event(bot, "VALID", phone, buyer_id, session_name=session_name)
             await archive_account(
-                bot, "VALID", phone, auth_key, dc_id, tg_uid, session_path, buyer_id
+                bot,
+                "VALID",
+                phone,
+                auth_key,
+                dc_id,
+                tg_uid,
+                session_path,
+                buyer_id,
+                item_id=item_id,
             )
-            cleanup_session_file(session_path)
             return
 
-        # --- NOVALID: архив + спросить продолжать ли ---
+        # --- NOVALID: архив + спросить ---
         if result == "NOVALID":
             await log_event(
                 bot,
@@ -1253,9 +1663,16 @@ async def process_verification(event, start_param: str):
                 extra=f"item={item_id}",
             )
             await archive_account(
-                bot, "NOVALID", phone, auth_key, dc_id, tg_uid, session_path, buyer_id
+                bot,
+                "NOVALID",
+                phone,
+                auth_key,
+                dc_id,
+                tg_uid,
+                session_path,
+                buyer_id,
+                item_id=item_id,
             )
-            cleanup_session_file(session_path)
             go, status_msg = await ask_continue(
                 event,
                 status_msg,
@@ -1298,8 +1715,8 @@ async def process_verification(event, start_param: str):
                 session_path,
                 buyer_id,
                 extra=f"claim={'ok' if claim_ok else 'fail'}",
+                item_id=item_id,
             )
-            cleanup_session_file(session_path)
             claim_line = "Претензия отправлена." if claim_ok else "Претензия не создалась."
             go, status_msg = await ask_continue(
                 event,
@@ -1324,9 +1741,16 @@ async def process_verification(event, start_param: str):
             extra=f"item={item_id}",
         )
         await archive_account(
-            bot, "ERROR", phone, auth_key, dc_id, tg_uid, session_path, buyer_id
+            bot,
+            "ERROR",
+            phone,
+            auth_key,
+            dc_id,
+            tg_uid,
+            session_path,
+            buyer_id,
+            item_id=item_id,
         )
-        cleanup_session_file(session_path)
         go, status_msg = await ask_continue(
             event,
             status_msg,
