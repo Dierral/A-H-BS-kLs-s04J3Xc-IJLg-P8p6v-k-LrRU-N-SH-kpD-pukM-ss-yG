@@ -469,11 +469,42 @@ async def archive_account(
 
 # ====================== MAMBA CHECK ======================
 
+def _classify_mamba_text(text: str) -> str | None:
+    t = (text or "").lower()
+    if not t:
+        return None
+    if "поздравляем" in t and ("анкета подтверждена" in t or "подтверждена" in t):
+        return "VALID"
+    if "анкета подтверждена" in t or "успешно подтвержд" in t:
+        return "VALID"
+    if any(
+        x in t
+        for x in (
+            "что-то пошло не так",
+            "something is wrong",
+            "не может использоваться для подтверждения",
+            "был использован ранее",
+            "не подходит для подтверждения",
+            "нельзя использовать",
+            "already been used",
+            "cannot be used",
+        )
+    ):
+        return "NOVALID"
+    return None
+
+
 async def check_mamba_with_session(
     session_path: Path | None = None,
     string_session: str | None = None,
     start_param: str = "",
 ) -> str:
+    """
+    VALID / NOVALID / DEAD / ERROR
+    DEAD  — сессия не логинится
+    NOVALID — залогинились, mamba отказала
+    ERROR — сеть/таймаут (не считаем аккаунт мёртвым)
+    """
     client = None
     try:
         if string_session:
@@ -481,10 +512,11 @@ async def check_mamba_with_session(
                 StringSession(string_session),
                 API_ID,
                 API_HASH,
-                device_model="PC",
+                device_model="Desktop",
                 system_version="Windows 10",
-                app_version="4.0",
-                lang_code="ru",
+                app_version="4.16.8 x64",
+                lang_code="en",
+                system_lang_code="en-US",
             )
         elif session_path:
             session_name = str(Path(session_path).with_suffix(""))
@@ -492,47 +524,102 @@ async def check_mamba_with_session(
                 session_name,
                 API_ID,
                 API_HASH,
-                device_model="PC",
+                device_model="Desktop",
                 system_version="Windows 10",
-                app_version="4.0",
-                lang_code="ru",
+                app_version="4.16.8 x64",
+                lang_code="en",
+                system_lang_code="en-US",
             )
         else:
+            print("[MAMBA CHECK] no session provided")
             return "ERROR"
 
-        async with asyncio.timeout(20):
-            await client.connect()
-            if not await client.is_user_authorized():
-                print("[-] session not authorized → DEAD")
+        # connect
+        try:
+            await asyncio.wait_for(client.connect(), timeout=25)
+        except asyncio.TimeoutError:
+            print("[MAMBA CHECK] connect timeout → ERROR")
+            return "ERROR"
+        except (AuthKeyUnregisteredError, UserDeactivatedError) as e:
+            print(f"[MAMBA CHECK] auth dead: {e}")
+            return "DEAD"
+        except SessionPasswordNeededError:
+            print("[MAMBA CHECK] 2FA needed → DEAD (фильтр password=no)")
+            return "DEAD"
+        except Exception as e:
+            print(f"[MAMBA CHECK] connect fail {type(e).__name__}: {e}")
+            # типичные «мёртвые» ключи
+            en = type(e).__name__.lower() + " " + str(e).lower()
+            if any(x in en for x in ("authkey", "unregistered", "deactivated", "user_deactivated")):
                 return "DEAD"
+            return "ERROR"
 
-            await client(
-                StartBotRequest(bot=MAMBA_BOT, peer=MAMBA_BOT, start_param=start_param)
+        try:
+            authorized = await client.is_user_authorized()
+        except Exception as e:
+            print(f"[MAMBA CHECK] is_user_authorized fail: {e}")
+            return "DEAD"
+
+        if not authorized:
+            print("[-] session not authorized → DEAD")
+            return "DEAD"
+
+        try:
+            me = await client.get_me()
+            print(f"[MAMBA CHECK] logged in as id={getattr(me, 'id', '?')} phone={getattr(me, 'phone', '?')}")
+        except Exception as e:
+            print(f"[MAMBA CHECK] get_me fail: {e}")
+
+        # /start mamba
+        try:
+            await asyncio.wait_for(
+                client(StartBotRequest(bot=MAMBA_BOT, peer=MAMBA_BOT, start_param=start_param)),
+                timeout=20,
             )
-            await asyncio.sleep(2.5)
-            messages = await client.get_messages(MAMBA_BOT, limit=15)
+        except FloodWaitError as e:
+            wait = min(int(getattr(e, "seconds", 5)), 30)
+            print(f"[MAMBA CHECK] FloodWait {wait}s")
+            await asyncio.sleep(wait)
+            try:
+                await client(StartBotRequest(bot=MAMBA_BOT, peer=MAMBA_BOT, start_param=start_param))
+            except Exception as e2:
+                print(f"[MAMBA CHECK] StartBot retry fail: {e2}")
+                return "ERROR"
+        except Exception as e:
+            print(f"[MAMBA CHECK] StartBotRequest fail: {e}")
+            # если уже в диалоге — попробуем просто /start текстом
+            try:
+                await client.send_message(MAMBA_BOT, f"/start {start_param}".strip())
+            except Exception as e2:
+                print(f"[MAMBA CHECK] send /start fail: {e2}")
+                return "ERROR"
 
+        # ждём ответ бота (несколько попыток)
+        for attempt in range(6):
+            await asyncio.sleep(1.5)
+            try:
+                messages = await client.get_messages(MAMBA_BOT, limit=20)
+            except Exception as e:
+                print(f"[MAMBA CHECK] get_messages fail: {e}")
+                continue
             for msg in messages:
-                text = (msg.message or "").lower()
-                if "поздравляем" in text and "анкета подтверждена" in text:
-                    return "VALID"
-                if (
-                    "что-то пошло не так" in text
-                    or "something is wrong" in text
-                    or "не может использоваться для подтверждения" in text
-                    or "был использован ранее" in text
-                ):
-                    return "NOVALID"
+                text = msg.message or ""
+                cls = _classify_mamba_text(text)
+                if cls:
+                    print(f"[MAMBA CHECK] classified {cls}: {text[:120]!r}")
+                    return cls
+            print(f"[MAMBA CHECK] no decisive reply yet attempt={attempt+1}")
 
-            return "NOVALID"
+        # залогинены, но mamba не дала понятный ответ → NOVALID (не ERROR)
+        print("[MAMBA CHECK] no clear mamba reply → NOVALID")
+        return "NOVALID"
 
-    except asyncio.TimeoutError:
-        return "ERROR"
     except (AuthKeyUnregisteredError, UserDeactivatedError):
         return "DEAD"
     except SessionPasswordNeededError:
         return "DEAD"
-    except FloodWaitError:
+    except FloodWaitError as e:
+        print(f"[MAMBA CHECK] FloodWait outer: {e}")
         return "ERROR"
     except Exception as e:
         print(f"[MAMBA CHECK] {type(e).__name__}: {e}")
@@ -978,9 +1065,8 @@ async def ask_continue(
     buyer_id: int,
 ) -> tuple[bool, object]:
     """
-    Показать кнопки «Купить следующий» / «Стоп».
-    True  — юзер нажал продолжить
-    False — стоп / таймаут
+    ВСЕГДА ждёт кнопку. Без нажатия «Купить следующий» покупки НЕ продолжаются.
+    При любой ошибке/таймауте → False (стоп).
     """
     buttons = [
         [
@@ -988,25 +1074,50 @@ async def ask_continue(
             Button.inline("🛑 Стоп", data=b"cont:no"),
         ]
     ]
-    status_msg = await update_status(status_msg, text, buttons=buttons)
 
-    key = f"{buyer_id}:{status_msg.id}"
+    # Новое сообщение с кнопками надёжнее, чем edit
+    prompt = None
+    try:
+        prompt = await event.respond(text, buttons=buttons)
+    except Exception as e:
+        print(f"[ASK_CONTINUE] respond fail: {e}")
+        try:
+            prompt = await status_msg.respond(text, buttons=buttons)
+        except Exception as e2:
+            print(f"[ASK_CONTINUE] status respond fail: {e2}")
+            try:
+                prompt = await update_status(status_msg, text, buttons=buttons)
+            except Exception as e3:
+                print(f"[ASK_CONTINUE] total fail: {e3}")
+                return False, status_msg
+
+    if prompt is None:
+        print("[ASK_CONTINUE] no prompt message → STOP")
+        return False, status_msg
+
+    key = f"{buyer_id}:{prompt.id}"
     loop = asyncio.get_event_loop()
     fut: asyncio.Future = loop.create_future()
     _pending_continue[key] = fut
+    print(f"[ASK_CONTINUE] waiting key={key} timeout={CONTINUE_TIMEOUT}s")
 
     try:
-        ok = await asyncio.wait_for(fut, timeout=CONTINUE_TIMEOUT)
-        return bool(ok), status_msg
+        ok = await asyncio.wait_for(asyncio.shield(fut), timeout=CONTINUE_TIMEOUT)
+        print(f"[ASK_CONTINUE] user chose ok={ok}")
+        return bool(ok), prompt
     except asyncio.TimeoutError:
+        print("[ASK_CONTINUE] timeout → STOP")
         try:
-            await status_msg.edit(
+            await prompt.edit(
                 text + f"\n\n⏱ Таймаут {CONTINUE_TIMEOUT}с — остановлено.",
                 buttons=None,
             )
         except Exception:
             pass
-        return False, status_msg
+        return False, prompt
+    except Exception as e:
+        print(f"[ASK_CONTINUE] wait error: {e} → STOP")
+        return False, prompt
     finally:
         _pending_continue.pop(key, None)
 
@@ -1116,6 +1227,7 @@ async def process_verification(event, start_param: str):
             string_session=string_session,
             start_param=start_param,
         )
+        print(f"[RESULT] phone={phone} item={item_id} → {result}")
 
         # --- VALID: успех, стоп ---
         if result == "VALID":
@@ -1253,16 +1365,24 @@ async def start_cmd(event):
     )
 
 
-@bot.on(events.CallbackQuery(pattern=rb"^cont:(yes|no)$"))
+@bot.on(events.CallbackQuery)
 async def on_continue_callback(event):
     """Обработка кнопок продолжения покупки."""
-    data = event.data.decode()
+    raw = event.data or b""
+    try:
+        data = raw.decode()
+    except Exception:
+        data = ""
+    print(f"[CALLBACK] from={event.sender_id} data={data!r} msg={event.message_id}")
+
+    if not data.startswith("cont:"):
+        return
+
     buyer_id = event.sender_id
     msg_id = event.message_id
     key = f"{buyer_id}:{msg_id}"
     fut = _pending_continue.get(key)
 
-    # также ищем по любому pending этого юзера (на случай edit id)
     if fut is None:
         for k, f in list(_pending_continue.items()):
             if k.startswith(f"{buyer_id}:") and not f.done():
@@ -1270,31 +1390,27 @@ async def on_continue_callback(event):
                 key = k
                 break
 
-    ok = data.endswith("yes")
+    ok = data == "cont:yes"
     if fut is not None and not fut.done():
         fut.set_result(ok)
+        print(f"[CALLBACK] resolved key={key} ok={ok}")
+    else:
+        print(f"[CALLBACK] no pending future for {key}")
 
     try:
-        if ok:
-            await event.answer("Ищем следующий аккаунт...")
-            try:
-                await event.edit(
-                    (event.message.message or "") + "\n\n▶️ Продолжаем...",
-                    buttons=None,
-                )
-            except Exception:
-                pass
-        else:
-            await event.answer("Остановлено")
-            try:
-                await event.edit(
-                    (event.message.message or "") + "\n\n🛑 Остановлено.",
-                    buttons=None,
-                )
-            except Exception:
-                pass
+        await event.answer("Продолжаем..." if ok else "Стоп")
+    except Exception:
+        pass
+    try:
+        base = ""
+        if event.message:
+            base = event.message.message or ""
+        await event.edit(
+            base + ("\n\n▶️ Продолжаем..." if ok else "\n\n🛑 Остановлено."),
+            buttons=None,
+        )
     except Exception as e:
-        print(f"[CALLBACK] {e}")
+        print(f"[CALLBACK] edit fail: {e}")
 
 
 @bot.on(events.NewMessage(pattern=r"(?i).*(tg://|start=|mambarubot)"))
