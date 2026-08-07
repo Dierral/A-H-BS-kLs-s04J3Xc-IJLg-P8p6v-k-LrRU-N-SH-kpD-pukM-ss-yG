@@ -49,7 +49,7 @@ TOPIC_NOVALID = int(os.environ["TOPIC_NOVALID"])
 TOPIC_DEAD = int(os.environ["TOPIC_DEAD"])
 TOPIC_ERROR = int(os.environ["TOPIC_ERROR"])
 
-MAX_PRICE = float(os.environ.get("MAX_PRICE", "7"))
+MAX_PRICE = float(os.environ.get("MAX_PRICE", "8"))
 MAX_TRIES = int(os.environ.get("MAX_TRIES", "40"))
 RETRY_MAX = int(os.environ.get("RETRY_MAX", "30"))
 CURRENCY = os.environ.get("CURRENCY", "rub")
